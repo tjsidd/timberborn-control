@@ -1,0 +1,15 @@
+{
+  "rules": [
+    {
+      "id": "badwater-defense",
+      "enabled": false,
+      "description": "When an upstream contamination adapter is active, switch on a bypass lever.",
+      "when_adapters": {
+        "Badwater Detected": true
+      },
+      "operator": "all",
+      "action": "switch_on",
+      "lever": "Bypass Intake Lever"
+    }
+  ]
+}
