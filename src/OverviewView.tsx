@@ -17,11 +17,16 @@ type Relation = { parentId: string; direction: Direction };
 type AssumedDraft = { anchorId: string; name: string; priority: string; direction: TankDirection; parentTankId: string; inletGateId: string; outletGateId: string; sensorNames: string[] };
 const directions: Record<Direction, { x: number; y: number; label: string; position: Position }> = {
   N: { x: 0, y: -460, label: "North", position: Position.Top },
+  NE: { x: 620, y: -460, label: "Northeast", position: Position.Top },
   E: { x: 620, y: 0, label: "East", position: Position.Right },
+  SE: { x: 620, y: 460, label: "Southeast", position: Position.Bottom },
   S: { x: 0, y: 460, label: "South", position: Position.Bottom },
-  W: { x: -620, y: 0, label: "West", position: Position.Left }
+  SW: { x: -620, y: 460, label: "Southwest", position: Position.Bottom },
+  W: { x: -620, y: 0, label: "West", position: Position.Left },
+  NW: { x: -620, y: -460, label: "Northwest", position: Position.Top }
 };
-const opposite: Record<Direction, Direction> = { N: "S", E: "W", S: "N", W: "E" };
+type Cardinal = "N" | "E" | "S" | "W";
+const opposite: Record<Cardinal, Cardinal> = { N: "S", E: "W", S: "N", W: "E" };
 const mapNodeTypes = { tank: TankNodeView, gate: GateNodeView, anchor: AnchorNodeView };
 const elk = new ELK();
 const tankWidth = 260;
@@ -30,7 +35,7 @@ const gateHeight = 50;
 const tankHeight = (count: number) => 105 + Math.max(1, count) * 25;
 
 function Handles() {
-  return <>{(["N", "E", "S", "W"] as Direction[]).map((direction) => <Fragment key={direction}>
+  return <>{(["N", "E", "S", "W"] as Cardinal[]).map((direction) => <Fragment key={direction}>
     <Handle type="source" id={`${direction}-source`} position={directions[direction].position} className="map-handle" />
     <Handle type="target" id={`${direction}-target`} position={directions[direction].position} className="map-handle" />
   </Fragment>)}</>;
@@ -85,8 +90,8 @@ function relationFor(tank: Tank, tanks: Tank[], main: Tank): Relation | null {
   if (tank.id === main.id) return null;
   if (tank.direction) return { parentId: tank.parent_tank_id ?? main.id, direction: tank.direction };
   const name = tank.name.trim();
-  if (/^[NESW]$/i.test(name)) return { parentId: main.id, direction: name.toUpperCase() as Direction };
-  const suffix = name.match(/^(.+)\s+([NESW])$/i);
+  if (/^(NE|NW|SE|SW|[NESW])$/i.test(name)) return { parentId: main.id, direction: name.toUpperCase() as Direction };
+  const suffix = name.match(/^(.+)\s+(NE|NW|SE|SW|[NESW])$/i);
   if (!suffix) return null;
   const parent = tanks.find((candidate) => candidate.name.trim().toLowerCase() === suffix[1].trim().toLowerCase());
   return parent && parent.id !== tank.id ? { parentId: parent.id, direction: suffix[2].toUpperCase() as Direction } : null;
@@ -116,7 +121,7 @@ function buildGraph(snapshot: Snapshot, compact: boolean): { nodes: MapNode[]; e
         const index = siblings.findIndex((candidate) => candidate.id === tank.id);
         const offset = (index - (siblings.length - 1) / 2) * (relation.direction === "N" || relation.direction === "S" ? 330 : 360);
         const direction = directions[relation.direction];
-        positions.set(tank.id, { x: parent.x + direction.x + (direction.x === 0 ? offset : 0), y: parent.y + direction.y + (direction.y === 0 ? offset : 0) });
+        positions.set(tank.id, { x: parent.x + direction.x + (direction.x === 0 ? offset : 0), y: parent.y + direction.y + (direction.x === 0 ? 0 : offset) });
         changed = true;
       }
       if (!changed) break;
@@ -140,9 +145,10 @@ function buildGraph(snapshot: Snapshot, compact: boolean): { nodes: MapNode[]; e
   for (const tank of snapshot.tanks) {
     const relation = relations.get(tank.id);
     if (!relation || !positions.has(tank.id)) continue;
-    const branchSide = relation.direction === "N" || relation.direction === "S" ? "W" : "N";
+    const branchSide: Cardinal = relation.direction === "N" || relation.direction === "S" ? "W" : "N";
+    const targetSide = relation.direction.length === 2 ? opposite[relation.direction.includes("E") ? "E" : "W"] : branchSide;
     edges.push({ id: `branch-${tank.id}`, source: relation.parentId, target: tank.id,
-      sourceHandle: `${branchSide}-source`, targetHandle: `${branchSide}-target`,
+      sourceHandle: `${relation.direction.length === 2 ? opposite[targetSide] : branchSide}-source`, targetHandle: `${targetSide}-target`,
       type: "straight", className: "map-branch", selectable: false });
   }
 
@@ -234,7 +240,9 @@ function buildGraph(snapshot: Snapshot, compact: boolean): { nodes: MapNode[]; e
 }
 
 function configurationOf(snapshot: Snapshot): Configuration {
-  return { auto_delete_missing_sensors: snapshot.auto_delete_missing_sensors, graph_positions: snapshot.graph_positions, tanks: snapshot.tanks,
+  return { auto_delete_missing_sensors: snapshot.auto_delete_missing_sensors, graph_positions: snapshot.graph_positions,
+    adaptive_flow_enabled: snapshot.adaptive_flow_enabled, adaptive_target_percent: snapshot.adaptive_target_percent,
+    adaptive_flow_estimates: snapshot.adaptive_flow_estimates, tanks: snapshot.tanks,
     gates: snapshot.gates,
     sensors: snapshot.sensors.map(({ adapter_name, type, role, tank_id, last_state, last_seen_at }) => ({ adapter_name, type, role, tank_id, last_state, last_seen_at })),
     rules: snapshot.rules };
@@ -249,7 +257,7 @@ function gateState(gate: Gate, snapshot: Snapshot): string {
 function edgeHandles(source: { x: number; y: number }, target: { x: number; y: number }) {
   const dx = target.x - source.x;
   const dy = target.y - source.y;
-  const direction: Direction = Math.abs(dx) > Math.abs(dy) ? dx > 0 ? "E" : "W" : dy > 0 ? "S" : "N";
+  const direction: Cardinal = Math.abs(dx) > Math.abs(dy) ? dx > 0 ? "E" : "W" : dy > 0 ? "S" : "N";
   return { sourceHandle: `${direction}-source`, targetHandle: `${opposite[direction]}-target` };
 }
 

@@ -11,7 +11,7 @@ class Settings(BaseSettings):
         default="http://localhost:8080",
         description="Base URL for Timberborn's local automation API.",
     )
-    poll_interval_seconds: float = Field(default=2.0, ge=0.25)
+    poll_interval_seconds: float = Field(default=0.1, ge=0.1)
     request_timeout_seconds: float = Field(default=2.0, ge=0.25)
     cors_origin: str = Field(default="http://localhost:5173")
     config_path: Path = Field(default=Path("data/config.json"))

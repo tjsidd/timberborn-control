@@ -46,6 +46,16 @@ def test_tank_rejects_unknown_direction() -> None:
         Tank(id="t", name="Metalia", direction="upstream")
 
 
+@pytest.mark.parametrize("direction", ["NE", "SE", "SW", "NW"])
+def test_diagonal_direction_round_trip(tmp_path, direction: str) -> None:
+    store = ConfigStore(tmp_path / "config.json")
+    configuration = Configuration(tanks=[Tank(id="main", name="Main"),
+                                    Tank(id="branch", name="Branch", direction=direction,
+                                         parent_tank_id="main")])
+    store.save(configuration)
+    assert store.load().tanks[1].direction == direction
+
+
 def test_tank_can_be_placed_relative_to_another_tank(tmp_path) -> None:
     store = ConfigStore(tmp_path / "config.json")
     configuration = Configuration(

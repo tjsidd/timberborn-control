@@ -1,6 +1,14 @@
 from collections.abc import Mapping
 
-from timberborn_control.models import Adapter, Rule, RuleAction, RuleEvaluation, RuleOperator
+from timberborn_control.models import (
+    Adapter,
+    Rule,
+    RuleAction,
+    RuleCondition,
+    RuleEvaluation,
+    RuleOperator,
+    SensorCondition,
+)
 
 
 class RulesEngine:
@@ -12,7 +20,7 @@ class RulesEngine:
         if not rule.enabled:
             return RuleEvaluation(rule_id=rule.id, matched=False, skipped=True, reason="disabled")
 
-        if not rule.when_adapters:
+        if not rule.adapter_names:
             return RuleEvaluation(
                 rule_id=rule.id,
                 matched=False,
@@ -20,20 +28,27 @@ class RulesEngine:
                 reason="no adapter conditions configured",
             )
 
-        checks = []
-        missing = []
-        for name, expected_state in rule.when_adapters.items():
-            if name not in adapter_states:
-                missing.append(name)
-                checks.append(False)
-            else:
-                checks.append(adapter_states[name] is expected_state)
+        missing = [name for name in rule.adapter_names if name not in adapter_states]
 
         if missing:
             return RuleEvaluation(rule_id=rule.id, matched=False, skipped=True,
                                   reason=f"missing adapters: {', '.join(missing)}")
-        matched = all(checks) if rule.operator == RuleOperator.all else any(checks)
+        if rule.condition is not None:
+            matched = self._matches(rule.condition, adapter_states)
+        else:
+            checks = [adapter_states[name] is expected for name, expected in rule.when_adapters.items()]
+            matched = all(checks) if rule.operator == RuleOperator.all else any(checks)
         return RuleEvaluation(rule_id=rule.id, matched=matched)
+
+    def _matches(self, condition: RuleCondition, states: Mapping[str, bool]) -> bool:
+        if isinstance(condition, SensorCondition):
+            return states[condition.adapter_name] is condition.active
+        checks = [self._matches(child, states) for child in condition.children]
+        joins = condition.joins or [condition.operator] * (len(checks) - 1)
+        matched = checks[0]
+        for operator, check in zip(joins, checks[1:], strict=True):
+            matched = matched and check if operator == RuleOperator.all else matched or check
+        return matched
 
 
 def desired_lever_state(action: RuleAction) -> bool:

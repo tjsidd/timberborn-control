@@ -87,6 +87,30 @@ def test_missing_sensor_holds_lever(tmp_path) -> None:
     asyncio.run(run())
 
 
+def test_nested_rule_commands_lever_and_traces_every_input(tmp_path) -> None:
+    nested = Rule.model_validate({
+        "id": "nested", "action": "switch_on", "lever": "HTTP Gate",
+        "condition": {"kind": "group", "operator": "all", "children": [
+            {"kind": "sensor", "adapter_name": "X", "active": True},
+            {"kind": "group", "operator": "any", "children": [
+                {"kind": "sensor", "adapter_name": "Y", "active": True},
+                {"kind": "sensor", "adapter_name": "Z", "active": False},
+            ]},
+        ]},
+    })
+    controller, game = controller_for(tmp_path, [nested],
+                                      {"X": True, "Y": False, "Z": False}, {"HTTP Gate": False})
+
+    async def run() -> None:
+        snapshot = await controller.refresh_once()
+        assert game.commands == [("HTTP Gate", True)]
+        assert snapshot.decisions[0].inputs == {"X": True, "Y": False, "Z": False}
+        assert snapshot.events[-1].decision.inputs == snapshot.decisions[0].inputs
+        await controller.stop()
+
+    asyncio.run(run())
+
+
 @pytest.mark.parametrize("contamination", ["N C", "NW C"])
 def test_w_second_intake_is_forced_off_by_either_contamination(tmp_path,
                                                                contamination) -> None:

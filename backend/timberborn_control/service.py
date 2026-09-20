@@ -4,6 +4,12 @@ from datetime import UTC, datetime
 
 import httpx
 
+from timberborn_control.adaptive import (
+    AdaptiveCutoff,
+    AdaptiveFlowController,
+    FlowSample,
+    eligible_inputs,
+)
 from timberborn_control.config import Settings
 from timberborn_control.game_client import TimberbornClient
 from timberborn_control.models import (
@@ -56,12 +62,18 @@ class TimberbornController:
         self._lock = asyncio.Lock()
         self._last_sensor_save_at: datetime | None = None
         self._pending_commands: dict[str, tuple[bool, datetime]] = {}
+        self.adaptive = AdaptiveFlowController()
+        self.adaptive.reset(self.configuration.adaptive_flow_held_gate_ids)
+        self._adaptive_timer_task: asyncio.Task[None] | None = None
+        self._adaptive_deadline: datetime | None = None
 
     async def start(self) -> None:
         if self._task is None:
             self._task = asyncio.create_task(self._poll_loop(), name="timberborn-poll-loop")
 
     async def stop(self) -> None:
+        adaptive_task = self._adaptive_timer_task
+        self._cancel_adaptive_timer()
         if self._task:
             self._task.cancel()
             try:
@@ -69,6 +81,11 @@ class TimberbornController:
             except asyncio.CancelledError:
                 pass
             self._task = None
+        if adaptive_task:
+            try:
+                await adaptive_task
+            except asyncio.CancelledError:
+                pass
         await self.client.close()
 
     async def refresh_once(self) -> Snapshot:
@@ -105,6 +122,10 @@ class TimberbornController:
             connection=self.connection,
             auto_delete_missing_sensors=self.configuration.auto_delete_missing_sensors,
             graph_positions=self.configuration.graph_positions,
+            adaptive_flow_enabled=self.configuration.adaptive_flow_enabled,
+            adaptive_target_percent=self.configuration.adaptive_target_percent,
+            adaptive_flow_estimates=self.configuration.adaptive_flow_estimates,
+            adaptive_flow_statuses=self.adaptive.statuses(self.configuration),
             config_error=self.config_error,
             automation_error=self.automation_error,
             event_log_error=self.event_log_error,
@@ -151,6 +172,8 @@ class TimberbornController:
         self.event_log_error = None
         self._last_sensor_save_at = None
         self._pending_commands.clear()
+        self.adaptive.reset(configuration.adaptive_flow_held_gate_ids)
+        self._cancel_adaptive_timer()
 
     async def replace_rules(self, rules: list[Rule]) -> None:
         await self.replace_configuration(Configuration.model_validate({
@@ -159,6 +182,25 @@ class TimberbornController:
 
     async def replace_configuration(self, configuration: Configuration) -> None:
         async with self._lock:
+            old_inputs = {item.gate.id: (item.gate.destination_tank_id, item.gate.lever_name,
+                                          item.gate.open_when_on, item.low_sensor, item.high_sensor)
+                          for item in eligible_inputs(self.configuration)}
+            new_inputs = {item.gate.id: (item.gate.destination_tank_id, item.gate.lever_name,
+                                          item.gate.open_when_on, item.low_sensor, item.high_sensor)
+                          for item in eligible_inputs(configuration)}
+            valid_estimates = {gate_id: estimate
+                               for gate_id, estimate in self.configuration.adaptive_flow_estimates.items()
+                               if gate_id in new_inputs and old_inputs.get(gate_id) == new_inputs[gate_id]}
+            configuration = configuration.model_copy(update={
+                "adaptive_flow_estimates": valid_estimates})
+            reset_adaptive = (
+                configuration.adaptive_flow_enabled != self.configuration.adaptive_flow_enabled
+                or configuration.adaptive_target_percent != self.configuration.adaptive_target_percent
+                or configuration.gates != self.configuration.gates
+                or configuration.rules != self.configuration.rules
+                or [(sensor.adapter_name, sensor.tank_id, sensor.type) for sensor in configuration.sensors]
+                != [(sensor.adapter_name, sensor.tank_id, sensor.type) for sensor in self.configuration.sensors]
+            )
             known_names = {sensor.adapter_name for sensor in self.configuration.sensors}
             active_names = {adapter.name for adapter in self.adapters}
             incoming = {
@@ -174,6 +216,11 @@ class TimberbornController:
             configuration = Configuration.model_validate({
                 **configuration.model_dump(), "sensors": list(incoming.values()),
             })
+            configuration = configuration.model_copy(update={
+                "adaptive_flow_held_gate_ids": (
+                    set(self.configuration.adaptive_flow_held_gate_ids)
+                    if configuration.adaptive_flow_enabled else set()),
+            })
             configuration, gate_mappings = self._match_gate_levers(
                 configuration, self.levers if self.connection.ok else [],
             )
@@ -182,6 +229,9 @@ class TimberbornController:
             self.configuration = configuration
             self.rules = configuration.rules
             self._pending_commands.clear()
+            if reset_adaptive:
+                self.adaptive.reset(configuration.adaptive_flow_held_gate_ids)
+                self._cancel_adaptive_timer()
             self.config_error = None
             self.last_rule_evaluations = self.rules_engine.evaluate(self.rules, self.adapters)
             self.decisions = []
@@ -319,10 +369,86 @@ class TimberbornController:
                 base_url=self.settings.game_base_url,
                 last_seen_at=now,
             )
+            observation = self.adaptive.observe(
+                self.configuration, adapter_states,
+                {lever.name: lever.state for lever in levers}, now)
+            if self.adaptive.held_off != self.configuration.adaptive_flow_held_gate_ids:
+                self._save_adaptive_holds()
+            for log in observation.logs:
+                self._event(log.kind, log.message, log.detail)
+            for sample in observation.samples:
+                self._save_adaptive_sample(sample)
             self.last_rule_evaluations = self.rules_engine.evaluate(self.rules, self.adapters)
             self.automation_error = None
             self.decisions = []
-            await self._apply_decisions()
+            await self._apply_decisions(observation.cutoffs)
+            self._schedule_adaptive_deadline(observation.next_deadline)
+
+    def _save_adaptive_sample(self, sample: FlowSample) -> None:
+        estimates = {**self.configuration.adaptive_flow_estimates,
+                     sample.gate.id: sample.estimate}
+        updated = self.configuration.model_copy(update={"adaptive_flow_estimates": estimates})
+        try:
+            self.store.save(updated)
+        except OSError as exc:
+            self.config_error = f"Could not persist adaptive flow rate for {sample.gate.name}: {exc}"
+            self._event("adaptive.error", self.config_error, {"gate": sample.gate.name})
+            return
+        self.configuration = updated
+        self.config_error = None
+        self._event(
+            "adaptive.rate_updated",
+            f"{sample.gate.name}: learned {sample.estimate.fill_percent_per_second:.3f}% fill/s "
+            f"from D65 to D85 in {sample.elapsed_seconds:.2f}s.",
+            {"gate": sample.gate.name,
+             "observed_percent_per_second": sample.observed_rate,
+             "fill_percent_per_second": sample.estimate.fill_percent_per_second,
+             "elapsed_seconds": sample.elapsed_seconds,
+             "samples": sample.estimate.samples},
+        )
+
+    def _save_adaptive_holds(self) -> None:
+        updated = self.configuration.model_copy(update={
+            "adaptive_flow_held_gate_ids": set(self.adaptive.held_off)})
+        try:
+            self.store.save(updated)
+        except OSError as exc:
+            self.config_error = f"Could not persist adaptive hold state: {exc}"
+            self._event("adaptive.error", self.config_error)
+        else:
+            self.configuration = updated
+            self.config_error = None
+
+    def _cancel_adaptive_timer(self) -> None:
+        task = self._adaptive_timer_task
+        if task and task is not asyncio.current_task() and not task.done():
+            task.cancel()
+        self._adaptive_timer_task = None
+        self._adaptive_deadline = None
+
+    def _schedule_adaptive_deadline(self, deadline: datetime | None) -> None:
+        if not self.configuration.adaptive_flow_enabled or deadline is None:
+            self._cancel_adaptive_timer()
+            return
+        if (self._adaptive_timer_task and not self._adaptive_timer_task.done()
+                and self._adaptive_deadline == deadline):
+            return
+        self._cancel_adaptive_timer()
+        self._adaptive_deadline = deadline
+        self._adaptive_timer_task = asyncio.create_task(
+            self._refresh_at_deadline(deadline), name="timberborn-adaptive-deadline")
+
+    async def _refresh_at_deadline(self, deadline: datetime) -> None:
+        try:
+            await asyncio.sleep(max(0, (deadline - datetime.now(UTC)).total_seconds()))
+            self._adaptive_timer_task = None
+            self._adaptive_deadline = None
+            await self._refresh()
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:  # noqa: BLE001
+            self.automation_error = f"Adaptive deadline refresh failed: {exc}"
+            self._event("adaptive.error", self.automation_error)
 
     @staticmethod
     def _match_gate_levers(
@@ -350,9 +476,10 @@ class TimberbornController:
             self._event("config.auto_tagged", f"Tagged {kind} '{name}' to tank '{tank}'.",
                         {"kind": kind, "name": name, "tank": tank})
 
-    async def _apply_decisions(self) -> None:
+    async def _apply_decisions(self, cutoffs: list[AdaptiveCutoff]) -> None:
         lever_states = {lever.name: lever.state for lever in self.levers}
         rules_by_id = {rule.id: rule for rule in self.rules}
+        adaptive_gates = {item.gate.lever_name: item.gate for item in eligible_inputs(self.configuration)}
         chosen_rules: dict[str, str] = {}
 
         for evaluation in self.last_rule_evaluations:
@@ -366,10 +493,37 @@ class TimberbornController:
             self.decisions.append(AutomationDecision(
                 rule=rule.id,
                 inputs={name: next((a.state for a in self.adapters if a.name == name), None)
-                        for name in rule.when_adapters},
+                        for name in rule.adapter_names},
                 lever_name=rule.lever,
                 output_state=desired_lever_state(rule.action),
                 reason=rule.description or "Adapter conditions matched.",
+            ))
+
+        flush_active = any(adapter.name == "HTTP Flush" and adapter.state for adapter in self.adapters)
+        for cutoff in cutoffs:
+            lever_name = cutoff.gate.lever_name
+            target_state = not cutoff.gate.open_when_on
+            previous = next((decision for decision in self.decisions
+                             if decision.lever_name == lever_name), None)
+            if flush_active and previous and previous.output_state is cutoff.gate.open_when_on:
+                continue
+            if previous and previous.output_state is target_state:
+                continue
+            if previous:
+                self.decisions.remove(previous)
+                evaluation = next((item for item in self.last_rule_evaluations
+                                   if item.rule_id == previous.rule), None)
+                if evaluation:
+                    evaluation.reason = "overridden by adaptive flow cutoff"
+            self.decisions.append(AutomationDecision(
+                rule="adaptive-flow-cutoff",
+                inputs={cutoff.low_sensor: next((adapter.state for adapter in self.adapters
+                                                 if adapter.name == cutoff.low_sensor), None),
+                        cutoff.high_sensor: next((adapter.state for adapter in self.adapters
+                                                  if adapter.name == cutoff.high_sensor), None)},
+                lever_name=lever_name,
+                output_state=target_state,
+                reason=cutoff.reason,
             ))
 
         for decision in self.decisions:
@@ -386,12 +540,13 @@ class TimberbornController:
                 continue
             if pending is not None and pending[0] is target_state:
                 elapsed = (datetime.now(UTC) - pending[1]).total_seconds()
-                if elapsed < 30:
-                    if elapsed >= 5:
+                retry_after = 2 if decision.rule == "adaptive-flow-cutoff" else 30
+                if elapsed < retry_after:
+                    if elapsed >= min(5, retry_after / 2):
                         self.automation_error = (
                             f"Rule {decision.rule}: game still reports '{name}' "
                             f"{'off' if target_state else 'on'} after command; retrying in "
-                            f"{max(1, int(30 - elapsed))}s."
+                            f"{max(1, int(retry_after - elapsed))}s."
                         )
                     continue
             try:
@@ -406,6 +561,12 @@ class TimberbornController:
 
             self._pending_commands[name] = (target_state, datetime.now(UTC))
             lever_states[name] = target_state
+            adaptive_gate = adaptive_gates.get(name)
+            if adaptive_gate:
+                timer_log = self.adaptive.command(
+                    adaptive_gate, target_state is adaptive_gate.open_when_on, datetime.now(UTC))
+                if timer_log:
+                    self._event(timer_log.kind, timer_log.message, timer_log.detail)
             input_text = ", ".join(
                 f"{sensor}={str(value).lower() if value is not None else 'missing'}"
                 for sensor, value in decision.inputs.items()
@@ -416,9 +577,15 @@ class TimberbornController:
                 f"{'on' if target_state else 'off'}. {decision.reason}",
                 decision=decision,
             )
+            if decision.rule == "adaptive-flow-cutoff":
+                self._event("adaptive.closed", f"Adaptive flow closed {adaptive_gate.name if adaptive_gate else name}: "
+                            f"{decision.reason}", {"gate": adaptive_gate.name if adaptive_gate else name},
+                            decision=decision)
 
     def _mark_disconnected(self, error: str) -> None:
         was_ok = self.connection.ok
+        self.adaptive.reset(self.configuration.adaptive_flow_held_gate_ids)
+        self._cancel_adaptive_timer()
         self.connection = GameConnection(
             ok=False,
             base_url=self.settings.game_base_url,

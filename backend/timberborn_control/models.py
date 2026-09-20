@@ -1,5 +1,6 @@
 from datetime import UTC, datetime
 from enum import StrEnum
+from typing import Annotated, Literal
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -66,9 +67,13 @@ class SensorStatus(Sensor):
 
 class TankDirection(StrEnum):
     north = "N"
+    northeast = "NE"
     east = "E"
+    southeast = "SE"
     south = "S"
+    southwest = "SW"
     west = "W"
+    northwest = "NW"
 
 
 class Tank(BaseModel):
@@ -110,9 +115,31 @@ class GraphPosition(BaseModel):
     y: float = Field(allow_inf_nan=False)
 
 
+class AdaptiveFlowEstimate(BaseModel):
+    fill_percent_per_second: float = Field(gt=0, allow_inf_nan=False)
+    updated_at: datetime
+    samples: int = Field(default=1, ge=1)
+
+
+class AdaptiveFlowStatus(BaseModel):
+    gate_id: str
+    gate_name: str
+    tank_name: str
+    fill_percent_per_second: float | None = None
+    opened_at: datetime | None = None
+    band_started_at: datetime | None = None
+    predicted_close_at: datetime | None = None
+    held_off: bool = False
+    eligibility_error: str | None = None
+
+
 class Configuration(BaseModel):
     auto_delete_missing_sensors: bool = False
     graph_positions: dict[str, GraphPosition] = Field(default_factory=dict)
+    adaptive_flow_enabled: bool = False
+    adaptive_target_percent: float = Field(default=95, gt=85, le=100, allow_inf_nan=False)
+    adaptive_flow_estimates: dict[str, AdaptiveFlowEstimate] = Field(default_factory=dict)
+    adaptive_flow_held_gate_ids: set[str] = Field(default_factory=set)
     tanks: list[Tank] = Field(default_factory=list)
     gates: list[Gate] = Field(default_factory=list)
     sensors: list[Sensor] = Field(default_factory=list)
@@ -163,14 +190,49 @@ class RuleAction(StrEnum):
     switch_off = "switch_off"
 
 
+class SensorCondition(BaseModel):
+    kind: Literal["sensor"] = "sensor"
+    adapter_name: str = Field(min_length=1)
+    active: bool
+
+
+class ConditionGroup(BaseModel):
+    kind: Literal["group"] = "group"
+    operator: RuleOperator = RuleOperator.all
+    children: list["RuleCondition"] = Field(min_length=1)
+    joins: list[RuleOperator] | None = None
+
+    @model_validator(mode="after")
+    def joins_match_children(self) -> "ConditionGroup":
+        if self.joins is not None and len(self.joins) != len(self.children) - 1:
+            raise ValueError("condition group needs one join between each pair of children")
+        return self
+
+
+RuleCondition = Annotated[SensorCondition | ConditionGroup, Field(discriminator="kind")]
+
+
 class Rule(BaseModel):
     id: str
     enabled: bool = True
     description: str = ""
     when_adapters: dict[str, bool] = Field(default_factory=dict)
     operator: RuleOperator = RuleOperator.all
+    condition: RuleCondition | None = None
     action: RuleAction
     lever: str
+
+    @property
+    def adapter_names(self) -> list[str]:
+        if self.condition is None:
+            return list(self.when_adapters)
+
+        def names(node: RuleCondition) -> list[str]:
+            if isinstance(node, SensorCondition):
+                return [node.adapter_name]
+            return [name for child in node.children for name in names(child)]
+
+        return list(dict.fromkeys(names(self.condition)))
 
 
 class RuleEvaluation(BaseModel):
@@ -222,6 +284,10 @@ class Snapshot(BaseModel):
     connection: GameConnection
     auto_delete_missing_sensors: bool = False
     graph_positions: dict[str, GraphPosition] = Field(default_factory=dict)
+    adaptive_flow_enabled: bool = False
+    adaptive_target_percent: float = 95
+    adaptive_flow_estimates: dict[str, AdaptiveFlowEstimate] = Field(default_factory=dict)
+    adaptive_flow_statuses: list[AdaptiveFlowStatus] = Field(default_factory=list)
     config_error: str | None = None
     automation_error: str | None = None
     event_log_error: str | None = None

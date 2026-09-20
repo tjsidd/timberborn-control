@@ -21,12 +21,15 @@ the corresponding levers. See the [Timberborn API guide](https://timberborn.io/)
 ## Service Architecture
 
 - `backend/timberborn_control/game_client.py` calls Timberborn's local API.
-- `backend/timberborn_control/service.py` polls the game every two seconds by
+- `backend/timberborn_control/service.py` polls the game every 0.1 seconds by
   default, receives adapter webhooks, coordinates decisions, and sends lever
   commands. Webhooks cause an immediate refresh; polling discovers new adapters
   and recovers from missed events.
 - `backend/timberborn_control/rules.py` evaluates the ordered, explicit
-  adapter-to-lever rules. There is no separate gate automation policy.
+  adapter-to-lever rules. Optional adaptive flow control can only override an
+  eligible input with a close/hold decision; it never opens a gate.
+- `backend/timberborn_control/adaptive.py` tracks D65-to-D85 fill cycles,
+  predicts cutoff deadlines, and holds an input closed after a missed target.
 - `backend/timberborn_control/tagging.py` fills unambiguous tank associations
   from sensor and gate names without overwriting manual assignments.
 - `backend/timberborn_control/api.py` exposes status and configuration to the
@@ -36,7 +39,8 @@ the corresponding levers. See the [Timberborn API guide](https://timberborn.io/)
   saved through the same configuration API as the rest of the session.
 - `data/sessions.json` stores the active session and the list of named sessions.
   Each session has its own `data/sessions/<id>/config.json` for tanks, gates,
-  sensors, rules, and graph positions, plus `events.jsonl` for its event history.
+  sensors, rules, graph positions, adaptive settings, learned rates, and active
+  cutoff holds, plus `events.jsonl` for its event history.
   Configurations and the session index are written atomically. The most recent
   100 events from the active session are returned in status snapshots.
 
@@ -53,8 +57,9 @@ log to migrate. These local data files are ignored by Git.
 | Tank | Name, optional integer priority (`0` highest), and optional cardinal direction (`N`, `E`, `S`, `W`) relative to Main or an explicitly selected parent tank. Source tanks do not need a priority. |
 | Gate | 1m/2m/3m type, optional source and destination tanks, linked HTTP Lever, and whether lever on means open. Gates are descriptive; they never issue commands themselves. Exact heights stay configured in-game and are not read or set by this service. |
 | Graph position | Optional `x`/`y` coordinates keyed by graph node ID in the session's `graph_positions` map. Positions affect only the Overview display, not automation. |
+| Adaptive flow estimate | Per-input-gate fill rate in `%/second`, sample count, and update time. Learned from the D65-to-D85 interval and saved in the active session. |
 | Sensor | A persisted HTTP Adapter identity, optional type (`Depth`, `Resource`, `Flow`, `BadWater`), optional semantic role, tank association, last known boolean state, and last-seen time. Its current value is boolean or unavailable. |
-| Rule | ID, description, enabled flag (on by default), sensor conditions joined by AND or OR, and a target HTTP Lever state. An Inactive condition means NOT active. |
+| Rule | ID, description, enabled flag (on by default), nested sensor conditions with AND/OR joins between adjacent items, and a target HTTP Lever state. An Inactive condition means NOT active. |
 | AutomationDecision | The evaluated input states, selected rule, target lever state, and explanation. |
 | ServiceEvent | A timestamped event. Successful automation commands include their full decision trace and persist to JSONL. |
 
@@ -129,17 +134,26 @@ boxes does not change gate associations or issue lever commands.
 ## Rules Engine Overview
 
 On each game refresh, the service evaluates the current adapter and lever states.
-Enabled rules are the only source of automatic commands. Rules run in list order;
+Enabled rules normally choose lever states. The beta adaptive controller is a
+close-only exception for eligible input gates when enabled. Rules run in list order;
 the first matching rule owns its lever for that cycle. Later matching rules for
 that lever are marked shadowed. Rules with missing adapter inputs are skipped;
 if none match for a lever, it holds its current state. Gate metadata, tank
 priorities, and sensor roles have no automatic control behavior of their own.
 Manual commands to rule-governed levers are blocked by the UI and API.
 
-The rule editor expresses each rule as `When [sensor Active/Inactive] [AND/OR ...]
-Then [HTTP Lever] [Active/Inactive]`. Multiple conditions in one rule share the
-same join operator; use separate rules for mixed AND/OR groupings. An Inactive
-sensor condition is the equivalent of `NOT sensor active`.
+The rule editor expresses each rule as `When [conditions] Then [HTTP Lever]
+[Active/Inactive]`. Each AND/OR join sits between adjacent sensors or groups,
+so expressions such as `(A OR B) OR ((X AND Y) AND (Z AND D))` can be built
+directly. Joins evaluate left to right within a group; parentheses from nested
+groups set explicit precedence. Existing flat rules retain their original
+meaning and acquire per-boundary joins when edited. A missing sensor anywhere
+in a rule skips that rule, even
+when another branch of an OR group is true. An Inactive sensor condition is
+the equivalent of `NOT sensor active`.
+The editor can group adjacent conditions, ungroup a group without deleting its
+children, and reorder sibling conditions or groups. Rule-list up/down controls
+change rule priority immediately; condition edits take effect when the rule is saved.
 
 The service commands a lever only when its desired state differs from the game's
 reported state. Every successful engine command emits an `automation.commanded`
@@ -179,6 +193,42 @@ when N Main D65 is active and W D65 is inactive. W In 2 activates only while
 N Main D65 is active, W D65 is inactive, and both upstream contamination
 signals are inactive. W Out opens at W D85 and closes below W D65.
 
+### Adaptive Flow Control (Beta)
+
+The Configuration tab has an **Adaptive flow control** toggle, off by default,
+and a shutoff target above 85% and at most 100% (default 95%). The controller
+tracks fill cycles and learns rates even while the toggle is off. A gate is
+eligible only when it is the sole configured input to a tank, has a linked
+HTTP Lever governed by an enabled rule, and that tank has one D65 and one D85
+sensor. Configuration shows each input's learned rate or eligibility error.
+Beaverton's two W inputs are excluded because their individual contributions
+cannot be measured from one pair of tank sensors.
+
+Opening an eligible gate starts an open-duration timer. The 20% rate sample
+starts when D65 becomes active while the gate is open and ends when D85 becomes
+active; opening below D65 does not identify the starting water level. The
+observed rate is `20 / elapsed_seconds` percent fill per second. Each new
+sample updates the persisted estimate using 60% of the previous estimate and
+40% of the new observation. A sample is not invented if the gate closes before
+D85 is observed.
+
+With beta enabled and a learned rate, the predicted cutoff is
+`D65_time + (target_percent - 65) / fill_percent_per_second`. While D65 is
+active, the controller closes the input at D85 or the predicted deadline,
+whichever is observed first. D85 normally closes the gate before a 95% target;
+the prediction acts as a fallback when that signal remains inactive too long.
+If a required sensor disappears from the game response, adaptive control does
+not start a new prediction or treat the missing reading as false; an existing
+hold remains until D65 is confirmed inactive. If the
+deadline arrives while D85 is still inactive, it logs `adaptive.warning`,
+closes the gate, and persists a hold until D65 becomes inactive. That hold
+survives a backend restart. Normal rules remain responsible for opening the
+gate when filling may resume. The event log also records timer starts/stops,
+rate updates (`adaptive.rate_updated`), and adaptive closes (`adaptive.closed`).
+Timing uses wall-clock seconds; sensor transitions are observed through the
+game API's polling and webhooks, so estimates can be affected by polling delay
+or pausing the game. The controller never changes in-game threshold settings.
+
 ## Running Locally
 
 Backend, from the repository root:
@@ -212,7 +262,9 @@ Useful endpoints:
 - `POST /api/sessions/{id}/load` activates an existing session. Status snapshots
   include the active session ID/name and available sessions.
 - `POST /api/refresh` triggers a game refresh and decision pass.
-- `PUT /api/config` saves tanks, gates, sensor metadata, rules, and graph positions.
+- `PUT /api/config` saves tanks, gates, sensor metadata, rules, graph positions,
+  and adaptive flow settings. Learned rates and cutoff holds are maintained by
+  the service in the same session configuration.
 - `DELETE /api/sensors/{name}` removes a persisted sensor absent from the game.
 - `PUT /api/settings/sensors` with `{ "auto_delete_missing_sensors": true }` updates
   the automatic cleanup setting.
